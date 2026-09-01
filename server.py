@@ -35,7 +35,18 @@ import connector_bridge
 import tools
 
 SERVER_NAME = "dental-ai-research"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
+
+# What citation-verification contract this build implements. A client reads this to know whether
+# the server applies the online-first year tolerance and returns the explicit year fields, rather
+# than inferring it from the shape of a response. Bumped whenever those semantics change.
+#
+# 1.0 — title/year/DOI compared, year by exact equality. A one-year online-first vs issue
+#       difference was reported as NOT_VERIFIED.
+# 1.1 — title/authors/journal/year/DOI compared; year three-valued with a documented one-year
+#       tolerance; VERIFIED_WITH_METADATA_DISCREPANCY added; explicit pubmed_year / crossref_year
+#       / year_gap / year_tolerance / discrepancy_type / year_source_names returned.
+VERIFICATION_CONTRACT_VERSION = "1.1"
 
 # Protocol revisions this server can speak. The client's requested version is echoed back
 # when supported; otherwise we answer with our preferred one and let the client decide.
@@ -124,10 +135,15 @@ TOOL_DEFINITIONS = [
         "title": "Verify a citation",
         "description": (
             "Verify a citation against Crossref and PubMed. Accepts any combination of DOI, "
-            "PMID and title. Returns verification_status (VERIFIED / PARTIALLY_VERIFIED / "
-            "NOT_VERIFIED) with the metadata fields that were actually compared. A DOI that "
-            "does not resolve returns NOT_VERIFIED — a real finding, distinct from an upstream "
-            "failure. No identifier is ever invented."
+            "PMID and title. Returns verification_status (VERIFIED / "
+            "VERIFIED_WITH_METADATA_DISCREPANCY / PARTIALLY_VERIFIED / NOT_VERIFIED) with the "
+            "metadata fields that were actually compared (title, authors, journal, year, DOI). "
+            "VERIFIED_WITH_METADATA_DISCREPANCY means identity is confirmed and only the "
+            "publication year differs, within the documented online-first versus print/issue "
+            "tolerance of one year: both years are returned as pubmed_year and crossref_year "
+            "and neither is ever replaced. A year gap beyond that tolerance is NOT_VERIFIED. "
+            "A DOI that does not resolve returns NOT_VERIFIED — a real finding, distinct from "
+            "an upstream failure. No identifier is ever invented."
         ),
         "inputSchema": {
             "type": "object",
@@ -205,7 +221,8 @@ def _handle_initialize(req_id, params):
     return _result(req_id, {
         "protocolVersion": version,
         "capabilities": {"tools": {"listChanged": False}},
-        "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+        "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION,
+                       "verificationContractVersion": VERIFICATION_CONTRACT_VERSION},
         "instructions": (
             "Dental AI research tools. Four public tools: search_pubmed, "
             "search_systematic_reviews, verify_citation, search_clinical_trials. "
@@ -332,6 +349,7 @@ def application(environ, start_response):
         return _respond(start_response, "200 OK", {
             "service": SERVER_NAME,
             "version": SERVER_VERSION,
+            "verification_contract_version": VERIFICATION_CONTRACT_VERSION,
             "transport": "mcp-streamable-http",
             "mcp_endpoint": "/mcp",
             "health_endpoint": "/health",
