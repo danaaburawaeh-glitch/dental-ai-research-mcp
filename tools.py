@@ -267,6 +267,112 @@ def _norm_title(t):
     return "".join(ch.lower() for ch in t if ch.isalnum() or ch.isspace()).split()
 
 
+# --------------------------------------------------------------------------
+# Citation verification parity with the plugin's v1.2 evidence layer.
+#
+# These constants and comparators mirror
+# plugin/dana-dental-research/evidence/citation_verification.py and
+# connectors/shared/normalization.py. They exist here so that BOTH transports return the same
+# citation semantics for the same pair of records — a client must never have to know which
+# transport answered in order to interpret the verdict.
+#
+# The specific divergence this closes: this server previously compared only title, year and DOI,
+# with the year by exact equality. A record whose Crossref issue year is one calendar year after
+# its PubMed online-first year came back NOT_VERIFIED, while the plugin's local path returned a
+# confirmed citation for the same record. Real example encountered in validation:
+# DOI 10.5005/jp-journals-10024-3981 (PubMed 2025, Crossref 2026).
+# --------------------------------------------------------------------------
+
+ONLINE_FIRST_YEAR_TOLERANCE = 1
+DISCREPANCY_ONLINE_FIRST = "ONLINE_FIRST_VS_ISSUE_YEAR"
+
+STATUS_VERIFIED = "VERIFIED"
+STATUS_VERIFIED_WITH_METADATA_DISCREPANCY = "VERIFIED_WITH_METADATA_DISCREPANCY"
+STATUS_PARTIALLY_VERIFIED = "PARTIALLY_VERIFIED"
+STATUS_NOT_VERIFIED = "NOT_VERIFIED"
+
+_JOURNAL_STOPWORDS = {"journal", "of", "the", "international", "and", "for"}
+
+
+def _surname(name):
+    """PubMed renders "Smith J" (surname first, initials last); Crossref renders "John Smith".
+    Trailing initials tokens are dropped and the last of what remains is the surname, so both
+    renderings — and compound surnames in either order — reduce to the same key."""
+    parts = str(name or "").replace(",", " ").split()
+    while len(parts) > 1 and len(parts[-1]) <= 3 and parts[-1].isalpha() and parts[-1].isupper():
+        parts.pop()
+    if not parts:
+        return None
+    return parts[-1].strip().lower()
+
+
+def _authors_match(a, b):
+    """Substantial author agreement = at least one shared surname. Returns None when either
+    side has no author list, because that is an absence, not a disagreement."""
+    if not a or not b:
+        return None
+    sa = {s for s in (_surname(x) for x in a) if s}
+    sb = {s for s in (_surname(x) for x in b) if s}
+    if not sa or not sb:
+        return None
+    return len(sa & sb) >= 1
+
+
+def _journals_match(a, b):
+    """Tolerant of abbreviation: PubMed returns ISO abbreviations ("Clin Oral Investig"),
+    Crossref returns full titles ("Clinical Oral Investigations")."""
+    if not a or not b:
+        return None
+    # _norm_title already returns a token LIST, not a string.
+    ta = [t for t in (_norm_title(a) or []) if t]
+    tb = [t for t in (_norm_title(b) or []) if t]
+    if not ta or not tb:
+        return None
+    if ta == tb:
+        return True
+    shorter, longer = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    j = 0
+    ok = True
+    for tok in shorter:
+        found = False
+        while j < len(longer):
+            cand = longer[j]
+            if cand.startswith(tok) or tok.startswith(cand):
+                found = True
+                j += 1
+                break
+            if cand not in _JOURNAL_STOPWORDS:
+                ok = False
+                break
+            j += 1
+        if not ok or not found:
+            ok = False
+            break
+    if ok:
+        return True
+    ca = set(ta) - _JOURNAL_STOPWORDS
+    cb = set(tb) - _JOURNAL_STOPWORDS
+    if not ca or not cb:
+        return None
+    return (len(ca & cb) / float(max(len(ca), len(cb)))) >= 0.6
+
+
+def _compare_years(pm_year, cr_year):
+    """Returns (verdict, gap) where verdict is True (identical), "WITHIN_TOLERANCE",
+    False (beyond tolerance), or None (not comparable)."""
+    if not pm_year or not cr_year:
+        return None, None
+    try:
+        gap = abs(int(pm_year) - int(cr_year))
+    except (TypeError, ValueError):
+        return None, None
+    if gap == 0:
+        return True, 0
+    if gap <= ONLINE_FIRST_YEAR_TOLERANCE:
+        return "WITHIN_TOLERANCE", gap
+    return False, gap
+
+
 def _titles_match(a, b):
     ta, tb = _norm_title(a), _norm_title(b)
     if not ta or not tb:
@@ -338,26 +444,76 @@ def verify_citation(doi=None, pmid=None, title=None):
         out_authors = out_authors or pm_rec.get("authors")
 
     metadata_match = {}
+    year_detail = {}
     if cr_rec and pm_rec:
-        tm = _titles_match(cr_rec.get("title"), pm_rec.get("title"))
-        metadata_match["title"] = tm
         cy = cr_rec.get("publication_year") or cr_rec.get("year")
         py = pm_rec.get("publication_year")
-        metadata_match["year"] = (int(cy) == int(py)) if (cy and py) else None
+        year_verdict, year_gap = _compare_years(py, cy)
+
+        metadata_match["title"] = _titles_match(cr_rec.get("title"), pm_rec.get("title"))
+        metadata_match["authors"] = _authors_match(cr_rec.get("authors"), pm_rec.get("authors"))
+        metadata_match["journal"] = _journals_match(
+            cr_rec.get("journal") or cr_rec.get("container_title"), pm_rec.get("journal"))
+        # `year` stays boolean-or-None for backward compatibility: a within-tolerance difference
+        # is not an agreement, so it reports False here, and the full three-valued reading is in
+        # `year_comparison` / `discrepancy_type` alongside it.
+        metadata_match["year"] = (True if year_verdict is True
+                                  else None if year_verdict is None else False)
         cd = (cr_rec.get("doi") or "").lower().strip()
         pd = (pm_rec.get("doi") or "").lower().strip()
         metadata_match["doi"] = (cd == pd) if (cd and pd) else None
 
-        checks = [v for v in metadata_match.values() if v is not None]
-        if checks and all(checks):
-            status = "VERIFIED"
+        year_detail = {
+            "pubmed_year": py,
+            "crossref_year": cy,
+            "year_gap": year_gap,
+            "year_tolerance": ONLINE_FIRST_YEAR_TOLERANCE,
+            "year_comparison": ("MATCH" if year_verdict is True
+                                else "WITHIN_TOLERANCE" if year_verdict == "WITHIN_TOLERANCE"
+                                else "MISMATCH" if year_verdict is False
+                                else "NOT_COMPARABLE"),
+            "year_source_names": {"pubmed_year_from": "pubmed",
+                                  "crossref_year_from": "crossref"},
+        }
+
+        identity_established = (metadata_match["doi"] is True) or all(
+            metadata_match.get(f) is True for f in ("title", "authors", "journal"))
+        non_year_mismatch = [f for f in ("title", "authors", "journal", "doi")
+                             if metadata_match.get(f) is False]
+        comparable = [v for f, v in metadata_match.items()
+                      if f != "year" and v is not None]
+
+        if non_year_mismatch:
+            status = STATUS_NOT_VERIFIED
+            note = ("Crossref and PubMed both returned a record but they disagree on "
+                    + ", ".join(non_year_mismatch) +
+                    ". Treat this citation as unconfirmed until resolved. Neither value has "
+                    "been altered or preferred.")
+        elif year_verdict == "WITHIN_TOLERANCE" and identity_established:
+            status = STATUS_VERIFIED_WITH_METADATA_DISCREPANCY
+            note = ("Identity is confirmed (DOI, title, authors and journal agree) and only the "
+                    f"publication year differs, by {year_gap} year, within the documented "
+                    f"online-first versus print/issue tolerance of {ONLINE_FIRST_YEAR_TOLERANCE}. "
+                    f"PubMed reports {py}; Crossref reports {cy}. Both values are reported and "
+                    "neither has been replaced. This is a metadata discrepancy, not a failed "
+                    "verification.")
+        elif year_verdict is False:
+            status = STATUS_NOT_VERIFIED
+            note = (f"PubMed reports {py} and Crossref reports {cy}, a gap of {year_gap} years, "
+                    f"which exceeds the documented online-first tolerance of "
+                    f"{ONLINE_FIRST_YEAR_TOLERANCE}. Online-first versus issue dating does not "
+                    "account for it, so the disagreement is unexplained. Neither value has been "
+                    "altered.")
+        elif year_verdict == "WITHIN_TOLERANCE":
+            status = STATUS_PARTIALLY_VERIFIED
+            note = ("The publication years differ within tolerance, but too little other "
+                    "metadata was comparable to establish that these records describe the same "
+                    "work.")
+        elif comparable and all(v is True for v in comparable):
+            status = STATUS_VERIFIED
             note = "Confirmed independently by Crossref and PubMed; compared fields agree."
-        elif any(v is False for v in metadata_match.values()):
-            status = "NOT_VERIFIED"
-            note = ("Crossref and PubMed both returned a record but their metadata "
-                    "disagrees. Treat this citation as unconfirmed until resolved.")
         else:
-            status = "PARTIALLY_VERIFIED"
+            status = STATUS_PARTIALLY_VERIFIED
             note = "Both sources returned a record but too few fields were comparable."
     elif cr_rec:
         status = "PARTIALLY_VERIFIED"
@@ -390,6 +546,16 @@ def verify_citation(doi=None, pmid=None, title=None):
         "year": out_year,
         "authors": out_authors,
         "metadata_match": metadata_match,
+        # Additive fields (v1.2 RC). Existing keys and the tool name are unchanged, so an older
+        # client keeps working; a v1.2 client reads the explicit years and discrepancy type.
+        "pubmed_year": year_detail.get("pubmed_year"),
+        "crossref_year": year_detail.get("crossref_year"),
+        "year_comparison": year_detail.get("year_comparison"),
+        "year_gap": year_detail.get("year_gap"),
+        "year_tolerance": year_detail.get("year_tolerance", ONLINE_FIRST_YEAR_TOLERANCE),
+        "year_source_names": year_detail.get("year_source_names"),
+        "discrepancy_type": (DISCREPANCY_ONLINE_FIRST
+                             if status == STATUS_VERIFIED_WITH_METADATA_DISCREPANCY else None),
         "sources_consulted": sources or ["crossref" if doi else "pubmed"],
         "query": query_desc,
         "source_provenance": {

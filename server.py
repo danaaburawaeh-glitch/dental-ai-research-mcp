@@ -124,10 +124,15 @@ TOOL_DEFINITIONS = [
         "title": "Verify a citation",
         "description": (
             "Verify a citation against Crossref and PubMed. Accepts any combination of DOI, "
-            "PMID and title. Returns verification_status (VERIFIED / PARTIALLY_VERIFIED / "
-            "NOT_VERIFIED) with the metadata fields that were actually compared. A DOI that "
-            "does not resolve returns NOT_VERIFIED — a real finding, distinct from an upstream "
-            "failure. No identifier is ever invented."
+            "PMID and title. Returns verification_status (VERIFIED / "
+            "VERIFIED_WITH_METADATA_DISCREPANCY / PARTIALLY_VERIFIED / NOT_VERIFIED) with the "
+            "metadata fields that were actually compared (title, authors, journal, year, DOI). "
+            "VERIFIED_WITH_METADATA_DISCREPANCY means identity is confirmed and only the "
+            "publication year differs, within the documented online-first versus print/issue "
+            "tolerance of one year: both years are returned as pubmed_year and crossref_year "
+            "and neither is ever replaced. A year gap beyond that tolerance is NOT_VERIFIED. "
+            "A DOI that does not resolve returns NOT_VERIFIED — a real finding, distinct from "
+            "an upstream failure. No identifier is ever invented."
         ),
         "inputSchema": {
             "type": "object",
