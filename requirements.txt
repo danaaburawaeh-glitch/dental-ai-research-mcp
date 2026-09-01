@@ -1,0 +1,3 @@
+# The server and all four connectors are pure Python standard library.
+# The only production dependency is the WSGI server that fronts them.
+gunicorn==23.0.0

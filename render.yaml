@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: dental-ai-research-mcp
+    runtime: python
+    plan: starter          # no spin-down; free tier cold-starts ~50s (see DEPLOY.md)
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 60
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      # Optional. Raises the NCBI rate limit from 3/s to 10/s. Not required.
+      # Set as a SECRET in the Render dashboard - never commit a value here.
+      - key: NCBI_API_KEY
+        sync: false
+      - key: NCBI_EMAIL
+        sync: false
+      - key: CROSSREF_MAILTO
+        sync: false
